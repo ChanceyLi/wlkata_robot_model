@@ -2,22 +2,46 @@ import numpy as np
 import math
 from mirobot import Mirobot
 
-a1, a2, a3, b1, b4, b6 = 32, 108, 20, 80, 176, 20  # 机器人变换矩阵参数
+a1, a2, a3, b1, b4, b6 = 32, 108, 20, 80, 176, 20  # 机器人DH参数
 upper = [100, 60, 50, 90, 40, 90]  # 机器人角度限制
 lower = [-100, -30, -50, -90, -90, -90]
 
 
+def __the2_inv(x, y, z, theta1, xi):
+    s = z - b1
+    r = -math.sqrt((x - a1 * math.cos(theta1)) ** 2 + (y - a1 * math.sin(theta1)) ** 2)
+    Omega = math.atan2(s, r)
+    lambda_ = math.atan2(math.sqrt(b4 ** 2 + a3 ** 2) * math.sin(xi),
+                         a2 + math.sqrt(b4 ** 2 + a3 ** 2) * math.cos(xi))
+    return -(Omega - lambda_)
+
+
+def the2_o(x, y, z, theta1, xi):
+    s = z - b1
+    r = math.sqrt((x - a1 * math.cos(theta1)) ** 2 + (y - a1 * math.sin(theta1)) ** 2)
+    Omega = math.atan2(s, r)
+    lambda_ = math.atan2(math.sqrt(b4 ** 2 + a3 ** 2) * math.sin(xi),
+                         a2 + math.sqrt(b4 ** 2 + a3 ** 2) * math.cos(xi))
+    return -(Omega - lambda_)
+
+
+def my_loss(a):
+    if -1e-3 <= a <= 1e-3:
+        return 0
+    return a
+
+
 class Motivation:
-    __theta = [0, 0, 0, 0, 0, 0]  # 角度
-    __Theta = [0, 0, 0, 0, 0, 0]  # 弧度
-    size = 0
-    __position = np.matrix([[0], [0], [0], [1]])  # 末端位置
-    __robot = 0
-    __T = 0
-    __J = 0
+
+    size = 6
 
     def __init__(self):
-        pass
+        self.__theta = [0.0, 0, 0, 0, 0, 0]  # 角度
+        self.__Theta = [0.0, 0, 0, 0, 0, 0]  # 弧度
+        self.__position = [0.0, 0, 0, 0, 0, 0]
+        self.__robot = None
+        self.__T = 0
+        self.__J = 0
 
     def set_angle(self, theta):  # 更新角度
         self.__theta = theta
@@ -35,8 +59,20 @@ class Motivation:
         self.get_axis_with_angle()
         return is_legal
 
-    def set_position(self, x, y, z, alpha, beta, gamma):
-        self.inverse_kinematics_roll(x, y, z, alpha, beta, gamma)
+    def set_position(self, position):
+        T = np.matrix([[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 1]], dtype=float)
+        Rx = np.matrix([[1, 0, 0], [0, math.cos(position[3]), -math.sin(position[3])],
+                        [0, math.sin(position[3]), math.cos(position[3])]])
+        Ry = np.matrix([[math.cos(position[4]), 0, math.sin(position[4])], [0, 1, 0],
+                        [-math.sin(position[4]), 0, math.cos(position[4])]])
+        Rz = np.matrix([[math.cos(position[5]), -math.sin(position[5]), 0],
+                        [math.sin(position[5]), math.cos(position[5]), 0], [0, 0, 1]])
+        T[:3, :3] = Rz @ Ry @ Rx
+        T[0, 3] = position[0]
+        T[1, 3] = position[1]
+        T[2, 3] = position[2]
+        self.__T = T
+        self.inverse_kinematics(T)
         is_legal = self.is_legal_angle()
         return is_legal
 
@@ -67,8 +103,18 @@ class Motivation:
                          [0, 0, 0, 1]])
         T06 = T01 @ T12 @ T23 @ T34 @ T45 @ T56
         self.__T = T06
-        P = np.matrix([[0], [0], [0], [1]])
-        self.__position = T06 @ P
+
+        beta = math.atan2(-T06[2, 0], math.sqrt(T06[0, 0] ** 2 + T06[1, 0] ** 2))
+        if abs(beta - math.pi / 2) < 0.001:
+            alpha = math.atan2(T06[0, 1], T06[1, 1])
+            gamma = 0
+        elif abs(beta + math.pi / 2) < 0.001:
+            alpha = -math.atan2(T06[0, 1], T06[1, 1])
+            gamma = 0
+        else:
+            alpha = math.atan2(T06[2, 1] / math.cos(beta), T06[2, 2] / math.cos(beta))
+            gamma = math.atan2(T06[1, 0] / math.cos(beta), T06[0, 0] / math.cos(beta))
+        self.__position = [T06[0, 3], T06[1, 3], T06[2, 3], alpha, beta, gamma]
 
     def get_position(self):
         return self.__position
@@ -85,6 +131,9 @@ class Motivation:
     def get_jacobi(self):
         self.jacobi()
         return self.__J
+
+    def get_robot_status(self):
+        return self.__robot
 
     def __to_radian(self):  # 角度变弧度
         for i in range(len(self.__theta)):
@@ -110,38 +159,25 @@ class Motivation:
         return is_legal
 
     def robot_initial(self):  # 初始化机器人
+        ret = 0
         if not self.__robot:
-            self.__robot = Mirobot(portname='COM4', debug=False)
-        self.__robot.home_simultaneous(wait=True)
+            try:
+                self.__robot = Mirobot(portname='COM4', debug=False)
+                self.__robot.home_simultaneous(wait=True)
+            except:
+                ret = -1
+        return ret
 
-    def run_robot_angle(self):  # 更改机器人到当前角度
+    def run_robot(self):  # 更改机器人到当前角度
         target_angles = {1: self.__theta[0], 2: self.__theta[1], 3: self.__theta[2],
                          4: self.__theta[3], 5: self.__theta[4], 6: self.__theta[5]}
         self.__robot.set_joint_angle(target_angles, wait=True)
 
+    def draw_line(self, lines):
+        pass
+
     def get_status(self):
         return self.__robot.get_status()
-
-    def __my_loss(self, a):
-        if -1e-3 <= a <= 1e-3:
-            return 0
-        return a
-
-    def __the2_o(self, x, y, z, theta1, xi):
-        s = z - b1
-        r = math.sqrt((x - a1 * math.cos(theta1)) ** 2 + (y - a1 * math.sin(theta1)) ** 2)
-        Omega = math.atan2(s, r)
-        lambda_ = math.atan2(math.sqrt(b4 ** 2 + a3 ** 2) * math.sin(xi),
-                             a2 + math.sqrt(b4 ** 2 + a3 ** 2) * math.cos(xi))
-        return -(Omega - lambda_)
-
-    def __the2_inv(self, x, y, z, theta1, xi):
-        s = z - b1
-        r = -math.sqrt((x - a1 * math.cos(theta1)) ** 2 + (y - a1 * math.sin(theta1)) ** 2)
-        Omega = math.atan2(s, r)
-        lambda_ = math.atan2(math.sqrt(b4 ** 2 + a3 ** 2) * math.sin(xi),
-                             a2 + math.sqrt(b4 ** 2 + a3 ** 2) * math.cos(xi))
-        return -(Omega - lambda_)
 
     def inverse_kinematics(self, T):
         xi1 = 0
@@ -189,7 +225,7 @@ class Motivation:
             theta2i = no_solution
             # theta22i = NOSOLUTION
         else:
-            theta2i = self.__the2_o(omega_x, omega_y, omega_z, theta1, xi1)
+            theta2i = the2_o(omega_x, omega_y, omega_z, theta1, xi1)
             # theta22i = the2_inv(omega_x, omega_y, omega_z, theta1, xi1)
 
         # if theta3i == NOSOLUTION:
@@ -230,26 +266,15 @@ class Motivation:
             # theta66 = theta6 + math.pi
         the4, the5, the6 = theta4, theta5, theta6
 
-        the1 = float(format(self.__my_loss(the1 * 180 / math.pi), '.4f'))
-        the2 = float(format(self.__my_loss(the2 * 180 / math.pi + 90), '.4f'))
-        the3 = float(format(self.__my_loss(the3 * 180 / math.pi), '.4f'))
-        the4 = float(format(self.__my_loss(the4 * 180 / math.pi), '.4f'))
-        the5 = float(format(self.__my_loss(the5 * 180 / math.pi - 90), '.4f'))
-        the6 = float(format(self.__my_loss(the6 * 180 / math.pi), '.4f'))
+        the1 = float(format(my_loss(the1 * 180 / math.pi), '.4f'))
+        the2 = float(format(my_loss(the2 * 180 / math.pi + 90), '.4f'))
+        the3 = float(format(my_loss(the3 * 180 / math.pi), '.4f'))
+        the4 = float(format(my_loss(the4 * 180 / math.pi), '.4f'))
+        the5 = float(format(my_loss(the5 * 180 / math.pi - 90), '.4f'))
+        the6 = float(format(my_loss(the6 * 180 / math.pi), '.4f'))
 
         self.__theta = [the1, the2, the3, the4, the5, the6]
         self.__to_radian()
-
-    def inverse_kinematics_roll(self, x, y, z, alpha, beta, gamma):
-        T = np.matrix([[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 1]])
-        Rx = np.matrix([[1, 0, 0], [0, math.cos(alpha), -math.sin(alpha)], [0, math.sin(alpha), math.cos(alpha)]])
-        Ry = np.matrix([[math.cos(beta), 0, math.sin(beta)], [0, 1, 0], [-math.sin(beta), 0, math.cos(beta)]])
-        Rz = np.matrix([[math.cos(gamma), -math.sin(gamma), 0], [math.sin(gamma), math.cos(gamma), 0], [0, 0, 1]])
-        T[:3, :3] = Rz @ Ry @ Rx
-        T[0, 3] = x
-        T[1, 3] = y
-        T[2, 3] = z
-        self.inverse_kinematics(T)
 
     def jacobi(self):
         T01 = np.matrix([[math.cos(self.__Theta[0]), -math.sin(self.__Theta[0]), 0, 0],
